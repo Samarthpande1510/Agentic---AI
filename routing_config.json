@@ -1,7 +1,7 @@
 {
     "US": "stripe",
-    "UK": "stripe",
+    "UK": "adyen",
     "IN": "stripe",
     "EU": "adyen",
-    "global_default": "stripe"
+    "global_default": "adyen"
 }

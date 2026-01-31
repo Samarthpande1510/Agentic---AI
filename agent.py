@@ -4,8 +4,9 @@ from typing import Annotated, List, Union, TypedDict, Optional
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
-from tools import update_routing_tool
 from langgraph.graph import StateGraph, END
+from tools import update_routing_tool, fraud_mitigation_tool
+from utils import get_active_policies_summary
 
 from dotenv import load_dotenv
 
@@ -68,14 +69,14 @@ def observer_node(state: PaymentAgentState):
     # Initialize the return dictionary with defaults to prevent KeyErrors
     output = {
         "latest_logs": [],
-        "metrics": {"global_success_rate": 1.0, "failure_clusters": {}, "total_count": 0},
+        "metrics": {"global_success_rate": 1.0, "failure_clusters": {}, "total_count": 0,"security_alerts": {}},
         "reasoning_log": [],
         "current_hypothesis": "Monitoring..."
     }
 
     if os.path.exists(log_file):
         with open(log_file, "r") as f:
-            lines = f.readlines()[-50:]
+            lines = f.readlines()[-100:]
             for line in lines:
                 if not line.strip(): continue # Skip empty lines
                 try:
@@ -96,18 +97,32 @@ def observer_node(state: PaymentAgentState):
     successes = len([t for t in recent_txs if t['status'] == 'SUCCESS'])
     
     failure_map = {}
+    security_map = {}
     for t in recent_txs:
-        if t['status'] == 'FAILED':
-            # Use .get() to avoid KeyErrors if some logs are missing fields
-            key = f"{t.get('region','UNK')}_{t.get('gateway','UNK')}_{t.get('error_code','00')}"
+        status = t.get('status', 'UNK')
+        error_code = str(t.get('error_code', '00'))
+        
+        # 1. Track standard FAILED transactions (Outages/Auth issues)
+        if status == 'FAILED':
+            key = f"{t.get('region','UNK')}_{t.get('gateway','UNK')}_{error_code}"
             failure_map[key] = failure_map.get(key, 0) + 1
+        
+        # 2. Track REJECTED transactions (Spam/Carding Attacks)
+        elif status == 'REJECTED' or error_code == '429':
+            key = f"SPAM_ATTACK_{t.get('region','UNK')}"
+            security_map[key] = security_map.get(key, 0) + 1
+        
 
     output["latest_logs"] = recent_txs
     output["metrics"] = {
         "global_success_rate": successes / total,
         "failure_clusters": failure_map,
+        "security_alerts": security_map,
         "total_count": total
     }
+    log_msg = f"Observer: Parsed {total} txs."
+    if security_map:
+        log_msg += f" ALERT: Detected {sum(security_map.values())} potential spam attempts."
     output["reasoning_log"] = [f"Observer: Successfully parsed {total} transactions."]
     
     return output
@@ -122,23 +137,22 @@ def reasoner_node(state: PaymentAgentState):
     # Construct a clear snapshot for the LLM
     cluster_summary = json.dumps(clusters, indent=2)
 
+    # UPDATE THIS IN REASONER_NODE
     prompt = f"""
-    You are a Senior Payment Operations Manager. 
-    Analyze the following failure clusters observed in the last 50 transactions:
-    
-    DATA:
+    SYSTEM: You are a Payment Operations Diagnostic Engine.
+    DATA SNAPSHOT:
     {cluster_summary}
-    
     GLOBAL SUCCESS RATE: {metrics.get('global_success_rate', 0):.2%}
-    
+    SECURITY ALERTS: {metrics.get('security_alerts', {})}
+
     TASK:
-    1. Determine if a specific "Targeted Incident" is occurring.
-    2. A cluster is an incident if it has a high count (e.g., > 5) for a specific Region/Gateway/Error.
-    3. Identify the Root Cause.
-    4. If no clear pattern exists, label it as "Normal Noise".
-    
+    1. Identify if the current failures represent a "Technical Infrastructure Issue" or a "Malicious Traffic Pattern."
+    2. Analyze error codes using your knowledge of fintech standards (ISO 8583, HTTP Status Codes).
+    3. Determine the "blast radius" (is it one region, one gateway).
+    4. Formulate a hypothesis that a Decider can use to pick a tool.
+
     OUTPUT FORMAT:
-    Hypothesis: <Your finding>
+    Hypothesis: <Detailed diagnosis of root cause>
     Confidence: <0-100%>
     Anomaly Detected: <Yes/No>
     """
@@ -170,25 +184,46 @@ def decider_node(state: PaymentAgentState):
     """Decides to call a tool OR alert the human."""
     hypothesis = state['current_hypothesis']
     history = state.get('action_history', [])
+    active_securely = get_active_policies_summary()
 
     if not state['is_anomaly_detected']:
         return {"next_action": "MONITOR", "reasoning_log": ["Decider: No action needed."]}
-
-    prompt = f"""
-    Hypothesis: {hypothesis}
-    Past Actions Taken: {json.dumps(history[-5:])} (Last 5 actions)
     
-    - If a specific region is failing, call 'update_routing'.
-    - CHECK PAST ACTIONS: If you already rerouted this region recently, do not do it again unless necessary.
+    valid_regions = ["US", "UK", "IN", "EU"]
+
+    # UPDATE THIS IN DECIDER_NODE
+    prompt = f"""
+    SYSTEM: You are the Autonomous Payment Ops Decision Maker.
+    INPUT HYPOTHESIS: {hypothesis}
+    ACTIVE POLICIES: {active_securely}
+    PAST ACTIONS: {json.dumps(history[-5:])}
+
+    AVAILABLE TOOLS:
+    1. 'update_routing_tool': Best for fixing localized technical failures by moving traffic to a healthy partner.
+    2. 'fraud_mitigation_tool': Best for neutralizing malicious traffic patterns or bot attacks at the edge.
+
+    VALID REGIONS: {valid_regions}
+    NOTE: Do NOT use 'global_default' as a target_region for fraud_mitigation_tool. 
+    Apply blocks to specific affected regions only
+    If the region (e.g., US) already has an active 'BLOCK_IP_RANGE', DO NOT call the tool again.
+    
+    MISSION:
+    Choose the tool that best resolves the 'Hypothesis' provided. 
+    - If the issue is technical, focus on continuity (Routing).
+    - If the issue is malicious, focus on protection (Mitigation).
+    - Avoid redundant actions if past actions haven't had time to take effect.
+
+    DECISION:
+    Does this situation require an automated intervention? If so, call the most appropriate tool with precise arguments.
     """
 
-    llm_with_tools = llm.bind_tools([update_routing_tool])
+    llm_with_tools = llm.bind_tools([update_routing_tool, fraud_mitigation_tool])
     response = llm_with_tools.invoke(prompt)
     
     if response.tool_calls:
         tool_call = response.tool_calls[0]
         return {
-            "next_action": "update_routing",
+            "next_action": tool_call['name'], # This will be 'fraud_mitigation_tool' or 'update_routing_tool'
             "decision_args": json.dumps(tool_call['args']),
             "reasoning_log": [f"Decider: Proposed {tool_call['name']} with {tool_call['args']}"]
         }
@@ -197,12 +232,24 @@ def decider_node(state: PaymentAgentState):
 
 
 def executor_node(state: PaymentAgentState):
-    """Executes the tool and saves the action to history."""
+    """Dynamically executes the tool chosen by the Decider."""
+    tool_map = {
+        "update_routing_tool": update_routing_tool,
+        "fraud_mitigation_tool": fraud_mitigation_tool
+    }
+
+    # Extract the proposed tool name from the reasoning log or state
+    # A cleaner way is to store the tool name in state['next_action']
+    proposed_tool = state.get("next_action")
     args = json.loads(state['decision_args'])
-    result = update_routing_tool.invoke(args)
-    
-    # Create a timestamped record
-    action_record = f"ACTION TAKEN: update_routing with {args} | RESULT: {result}"
+
+    if proposed_tool in tool_map:
+        result = tool_map[proposed_tool].invoke(args)
+    else:
+        # Fallback if the AI hallucinated a tool name
+        return {"reasoning_log": [f"Executor Error: Tool '{proposed_tool}' not found."]}
+
+    action_record = f"ACTION: {proposed_tool} | ARGS: {args} | RESULT: {result}"
     
     return {
         "reasoning_log": [f"Executor: {result}"],
@@ -220,8 +267,11 @@ workflow.add_edge("observer", "reasoner")
 workflow.add_edge("reasoner", "decider")
 
 def route_decision(state):
-    if state.get("next_action") == "update_routing":
+    target = state.get("next_action")
+    
+    if target in ["update_routing_tool", "fraud_mitigation_tool"]:
         return "executor"
+    
     return END
 
 workflow.add_conditional_edges(

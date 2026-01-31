@@ -13,3 +13,4 @@ venv/
 pyproject.toml
 uv.lock
 transactions.log
+security_policy.json
