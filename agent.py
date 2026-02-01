@@ -230,6 +230,12 @@ def decider_node(state: PaymentAgentState):
     
     return {"next_action": "ALERT_HUMAN", "reasoning_log": ["Decider: Alerting Human (No auto-fix)."]}
 
+def sentry_node(state: PaymentAgentState):
+    """
+    Pass-through node that only exists to provide an interrupt point 
+    for high-risk actions.
+    """
+    return state
 
 def executor_node(state: PaymentAgentState):
     """Dynamically executes the tool chosen by the Decider."""
@@ -261,6 +267,7 @@ workflow.add_node("observer", observer_node)
 workflow.add_node("reasoner", reasoner_node)
 workflow.add_node("decider", decider_node)
 workflow.add_node("executor", executor_node)
+workflow.add_node("sentry", sentry_node)
 
 workflow.set_entry_point("observer")
 workflow.add_edge("observer", "reasoner")
@@ -269,22 +276,27 @@ workflow.add_edge("reasoner", "decider")
 def route_decision(state):
     target = state.get("next_action")
     
-    if target in ["update_routing_tool", "fraud_mitigation_tool"]:
+    if target == "update_routing_tool":
         return "executor"
+    
+    if target == "fraud_mitigation_tool":
+        return "sentry"
     
     return END
 
 workflow.add_conditional_edges(
-    "decider",          # Start Node
-    route_decision,     # Logic Function
-    {                   # The Map: { "Return Value": "Target Node" }
+    "decider",
+    route_decision,
+    {
         "executor": "executor",
+        "sentry": "sentry",
         END: END
     }
 )
+workflow.add_edge("sentry", "executor")
 workflow.add_edge("executor", END)
 
 checkpointer = MemorySaver()
-app = workflow.compile(checkpointer=checkpointer, interrupt_before=["executor"])
+app = workflow.compile(checkpointer=checkpointer, interrupt_before=["sentry"])
 
 

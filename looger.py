@@ -100,7 +100,7 @@ def main():
             # Picking scenarios. Weighting RETRY_STORM at 0.1 for a quick burst
             current_mode = random.choices(
                 scenarios, 
-                weights=[0.05, 0, 0, 0, 0.95],
+                weights=[0.05, 0.95, 0, 0, 0],
                 k=1
             )[0]
 

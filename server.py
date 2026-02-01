@@ -69,21 +69,23 @@ async def run_cycle(req: AgentRequest):
 
 @api.get("/agent_state")
 async def get_agent_state(thread_id: str = "demo_session_1"):
-    """
-    Frontend calls this to check: 'Is the agent paused waiting for me?'
-    """
     config = get_config(thread_id)
     snapshot = app.get_state(config)
     
-    # Check if we are waiting for human input
-    if snapshot.next and "executor" in snapshot.next:
+    # NEW: Check for 'sentry' instead of 'executor'
+    if snapshot.next and "sentry" in snapshot.next:
         proposal_json = snapshot.values.get("decision_args")
+        # Let the frontend know which tool is being used
+        tool_name = snapshot.values.get("next_action") 
+        
         return {
             "status": "WAITING_FOR_APPROVAL",
-            "proposal": proposal_json # e.g. {"region": "UK", "gateway": "adyen"}
+            "proposal": proposal_json,
+            "tool": tool_name
         }
     
     return {"status": "IDLE", "proposal": None}
+
 
 @api.post("/approve_action")
 async def approve_action(req: ApprovalRequest):
